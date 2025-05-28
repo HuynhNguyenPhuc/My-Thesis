@@ -1,0 +1,399 @@
+from typing import *
+
+import os
+os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+import csv
+import json
+from tqdm import tqdm
+import re
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoTokenizer, CLIPTextModel
+from safetensors.torch import save_file
+
+from . import samplers
+from .base import Trainer
+from .utils import sample_logit_normal, slat_collate_fn
+from ..modules import sparse as sp
+from ..models import SparseStructureFlowModel, SLatFlowModel
+
+class TrellisTextTrainerDiffusion(Trainer):
+    def __init__(
+        self,
+        models: dict[str, nn.Module] = None,
+        sparse_structure_sampler: samplers.Sampler = None,
+        slat_sampler: samplers.Sampler = None,
+        slat_normalization: dict = None,
+        text_cond_model: str = None,
+    ):
+        if models is None:
+            return
+        super().__init__(models)
+        self.sparse_structure_sampler = sparse_structure_sampler
+        self.slat_sampler = slat_sampler
+        self.sparse_structure_sampler_params = {}
+        self.slat_sampler_params = {}
+        self.slat_normalization = slat_normalization
+        self._init_text_cond_model(text_cond_model)
+
+    @staticmethod
+    def from_pretrained(path: str) -> "TrellisTextTrainerDiffusion":
+        pipeline = super(TrellisTextTrainerDiffusion, TrellisTextTrainerDiffusion).from_pretrained(path)
+        new_pipeline = TrellisTextTrainerDiffusion()
+        new_pipeline.__dict__ = pipeline.__dict__
+        args = pipeline._pretrained_args
+
+        new_pipeline.path = path
+
+        new_pipeline.sparse_structure_sampler = getattr(samplers, args['sparse_structure_sampler']['name'])(**args['sparse_structure_sampler']['args'], device='cuda')
+        new_pipeline.sparse_structure_sampler_params = args['sparse_structure_sampler']['params']
+
+        new_pipeline.slat_sampler = getattr(samplers, args['slat_sampler']['name'])(**args['slat_sampler']['args'], device='cuda')
+        new_pipeline.slat_sampler_params = args['slat_sampler']['params']
+
+        new_pipeline.slat_normalization = args['slat_normalization']
+
+        new_pipeline._init_text_cond_model(args['text_cond_model'])
+        return new_pipeline
+    
+
+    def _init_text_cond_model(self, name: str):
+        """
+        Initialize the text conditioning model.
+        """
+        # load model
+        model = CLIPTextModel.from_pretrained(name).to(self.device)
+        tokenizer = AutoTokenizer.from_pretrained(name)
+        model.eval()
+        self.text_cond_model = {
+            'model': model,
+            'tokenizer': tokenizer,
+        }
+        self.text_cond_model['null_cond'] = self.encode_text([''])
+
+
+    @torch.no_grad()
+    def encode_text(self, text: List[str]) -> torch.Tensor:
+        """
+        Encode the text.
+        """
+        
+        assert isinstance(text, list) and all(isinstance(t, str) for t in text), "text must be a list of strings"
+        encoding = self.text_cond_model['tokenizer'](text, max_length=77, padding='max_length', truncation=True, return_tensors='pt')
+        tokens = encoding['input_ids'].to(self.device)
+        embeddings = self.text_cond_model['model'](input_ids=tokens).last_hidden_state
+        
+        return embeddings
+        
+
+    def compute_loss_ss(
+        self, 
+        sparse_structure: torch.Tensor, 
+        text_features: torch.Tensor,
+        cfg_dropout: float = 0.1
+    ):
+        flow_model = self.models['sparse_structure_flow_model']
+        reso = flow_model.module.resolution
+
+        batch_size = sparse_structure.shape[0]
+
+        # Classifier Free Guidance 
+        mask = torch.bernoulli(
+            torch.full((text_features.shape[0], 1, 1), 1 - cfg_dropout, device=self.device)
+        ).to(torch.float32)
+        text_features = text_features * mask
+
+
+        noise = torch.randn(batch_size, flow_model.module.in_channels, reso, reso, reso, device=self.device)
+
+        loss = self.sparse_structure_sampler.loss(model=flow_model,
+                                                    x0=sparse_structure,
+                                                    cond=text_features,
+                                                    noise=noise
+                                                    )
+        
+        return loss
+    
+
+    def compute_loss_slat(
+        self, 
+        structured_latent: sp.SparseTensor, 
+        text_features: torch.Tensor,
+        cfg_dropout: float = 0.1
+    ):
+        flow_model = self.models['slat_flow_model']
+        
+        # Compute the normalized SLat
+        std = torch.tensor(self.slat_normalization['std'], device=self.device).view(1, -1)
+        mean = torch.tensor(self.slat_normalization['mean'], device=self.device).view(1, -1)
+        normalized_slat = structured_latent.replace(structured_latent.feats.clone(), structured_latent.coords.clone())
+        normalized_slat.feats.sub_(mean).div_(std)
+        
+        feats = normalized_slat.feats
+        coords = normalized_slat.coords
+        batch_size = normalized_slat.shape[0]
+        N = normalized_slat.feats.shape[0]
+
+        # Classifier Free Guidance 
+        mask = torch.bernoulli(
+            torch.full((text_features.shape[0], 1, 1), 1 - cfg_dropout, device=self.device)
+        ).to(torch.float32)
+        text_features = text_features * mask
+        noise = normalized_slat.replace(torch.randn_like(normalized_slat.feats))
+        loss = self.slat_sampler.loss(model=flow_model,
+                                    x0=normalized_slat,
+                                    cond=text_features,
+                                    noise=noise
+                                    )
+        
+        return loss
+    
+
+    def train_ss_model(
+        self,
+        ss_train_dataset: torch.utils.data.Dataset,
+        ss_val_dataset: torch.utils.data.Dataset,
+        num_epochs: int = 2000,
+        batch_size: int = 32,
+        learning_rate: float = 1e-4,
+        save_dir: Optional[str] = None,
+        save_interval: int = 10,
+        plot_loss: bool = True
+    ):
+        self.ss_dim = 16**3 * 8
+        
+        if not save_dir:
+            save_dir = "TRELLIS-text/ss"
+        os.makedirs(save_dir, exist_ok=True)
+
+        folders = os.listdir(save_dir)
+        run_indices = sorted(int(re.search(r"run_(\d+)", folder).group(1)) for folder in folders if re.match(r"run_\d+", folder))
+        max_idx = run_indices[-1] if run_indices else -1
+        save_dir = os.path.join(save_dir, f"run_{max_idx+1}")
+
+        ckpt_dir = os.path.join(save_dir, "ckpts")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        ss_model_path = os.path.join(ckpt_dir, "ss_flow_txt_dit_B_16l8.safetensors")
+
+        log_file_path = os.path.join(save_dir, "ss_logs.csv")
+        with open(log_file_path, "w", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["Epoch", "Train Loss", "Val Loss"])
+
+        with open(f"{self.path}/ckpts/ss_flow_txt_dit_B_16l8.json", "r") as fp:
+            ss_flow_model_kwargs = json.load(fp)
+
+        self.models['sparse_structure_flow_model'] = SparseStructureFlowModel(**ss_flow_model_kwargs['args']).to(self.device)
+
+        optimizer_ss = torch.optim.AdamW(self.models['sparse_structure_flow_model'].parameters(), lr=learning_rate)
+        scaler_ss = torch.amp.GradScaler(device=self.device.type)
+
+        train_loader = torch.utils.data.DataLoader(
+            ss_train_dataset, batch_size=batch_size, num_workers=8, pin_memory=True, drop_last=True, persistent_workers=True
+        )
+        val_loader = torch.utils.data.DataLoader(
+            ss_val_dataset, batch_size=batch_size, num_workers=4, pin_memory=True, drop_last=False, persistent_workers=True
+        )
+
+        epoch_bar = tqdm(range(num_epochs), desc="Epochs", unit="epoch")
+        best_val_loss = float("inf")
+        train_loss_values = []
+        val_loss_values = []
+
+        for epoch in epoch_bar:
+            # Training
+            self.models['sparse_structure_flow_model'].train()
+            total_loss_ss = 0.0
+            num_train_batches = 0
+
+            for text, sparse_structure in train_loader:
+                sparse_structure = sparse_structure.to(self.device)
+                text_features = self.encode_text(text).to(self.device)
+
+                with torch.amp.autocast(device_type=self.device.type):
+                    loss_ss = self.compute_loss_ss(sparse_structure, text_features)
+
+                optimizer_ss.zero_grad()
+                scaler_ss.scale(loss_ss).backward()
+                scaler_ss.step(optimizer_ss)
+                scaler_ss.update()
+
+                total_loss_ss += loss_ss.item()
+                num_train_batches += 1
+
+            avg_train_loss = total_loss_ss / num_train_batches
+            train_loss_values.append(avg_train_loss)   
+
+            # Validation
+            self.models['sparse_structure_flow_model'].eval()
+            total_val_loss = 0.0
+            num_val_batches = 0
+            with torch.no_grad():
+                for text, sparse_structure in val_loader:
+                    sparse_structure = sparse_structure.to(self.device)
+                    text_features = self.encode_text(text).to(self.device)
+
+                    with torch.amp.autocast(device_type=self.device.type):
+                        loss_ss = self.compute_loss_ss(sparse_structure, text_features)
+
+                    total_val_loss += loss_ss.item()
+                    num_val_batches += 1
+
+            avg_val_loss = total_val_loss / num_val_batches if num_val_batches > 0 else 0
+            val_loss_values.append(avg_val_loss)
+
+            # Logging
+            epoch_bar.set_postfix({"Train Loss": f"{avg_train_loss:.4f}", "Val Loss": f"{avg_val_loss:.4f}"})
+
+            with open(log_file_path, "a", newline="") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow([epoch+1, f"{avg_train_loss:.4f}", f"{avg_val_loss:.4f}"])
+
+            if (epoch+1) % save_interval == 0 or avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                save_file(self.models['sparse_structure_flow_model'].module.state_dict(), ss_model_path)
+
+        if plot_loss:
+            plt.figure(figsize=(10, 5))
+            plt.plot(range(1, num_epochs + 1), train_loss_values, label="Train Loss", color="blue")
+            plt.plot(range(1, num_epochs + 1), val_loss_values, label="Val Loss", color="red")
+            plt.xlabel("Epochs")
+            plt.ylabel("Loss")
+            plt.title("Sparse Struture Flow Model - Training & Validation Loss")
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(save_dir, "ss_loss.png"), dpi=300, bbox_inches="tight")
+
+
+    def train_slat_model(
+        self,
+        slat_train_dataset: torch.utils.data.Dataset,
+        slat_val_dataset: torch.utils.data.Dataset,
+        num_epochs: int = 2000,
+        batch_size: int = 32,
+        learning_rate: float = 1e-4,
+        save_dir: Optional[str] = None,
+        save_interval: int = 10,
+        plot_loss: bool = True
+    ):
+        self.slat_dim = 64**3 * 8
+
+        if not save_dir:
+            save_dir = "TRELLIS-text/slat"
+        os.makedirs(save_dir, exist_ok=True)
+
+        folders = os.listdir(save_dir)
+        run_indices = sorted(int(re.search(r"run_(\d+)", folder).group(1)) for folder in folders if re.match(r"run_\d+", folder))
+        max_idx = run_indices[-1] if run_indices else -1
+        save_dir = os.path.join(save_dir, f"run_{max_idx+1}")
+
+        ckpt_dir = os.path.join(save_dir, "ckpts")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        slat_model_path = os.path.join(ckpt_dir, "slat_flow_txt_dit_B_64l8p2.safetensors")
+
+        log_file_path = os.path.join(save_dir, "slat_logs.csv")
+        with open(log_file_path, "w", newline="") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["Epoch", "Train Loss", "Val Loss"])
+
+        with open(f"{self.path}/ckpts/slat_flow_txt_dit_B_64l8p2.json", "r") as fp:
+            slat_flow_model_kwargs = json.load(fp)
+
+        self.models['slat_flow_model'] = SLatFlowModel(**slat_flow_model_kwargs['args']).to(self.device)
+
+        optimizer_slat = torch.optim.AdamW(self.models['slat_flow_model'].parameters(), lr=learning_rate)
+        scaler_slat = torch.amp.GradScaler(device=self.device.type)
+
+        train_loader = torch.utils.data.DataLoader(
+            slat_train_dataset, 
+            batch_size=batch_size, 
+            num_workers=8, 
+            pin_memory=True, 
+            drop_last=True, 
+            persistent_workers=False,
+            collate_fn=slat_collate_fn
+        )
+        val_loader = torch.utils.data.DataLoader(
+            slat_val_dataset, 
+            batch_size=batch_size, 
+            num_workers=1, 
+            pin_memory=True, 
+            drop_last=False, 
+            persistent_workers=False,
+            collate_fn=slat_collate_fn
+        )
+
+        epoch_bar = tqdm(range(num_epochs), desc="Epochs", unit="epoch")
+        best_val_loss = float("inf")
+        train_loss_values = []
+        val_loss_values = []
+
+        for epoch in epoch_bar:
+            # Training
+            self.models['slat_flow_model'].train()
+            total_loss_slat = 0.0
+            num_train_batches = 0
+
+            for text, structured_latent in train_loader:
+                structured_latent = sp.sparse_cat(structured_latent, dim=0).to(self.device)
+                text_features = self.encode_text(text).to(self.device)
+
+                with torch.amp.autocast(device_type=self.device.type):
+                    loss_slat = self.compute_loss_slat(structured_latent, text_features)
+
+                optimizer_slat.zero_grad()
+                scaler_slat.scale(loss_slat).backward()
+                scaler_slat.step(optimizer_slat)
+                scaler_slat.update()
+
+                total_loss_slat += loss_slat.item()
+                num_train_batches += 1
+
+            avg_train_loss = total_loss_slat / num_train_batches
+            train_loss_values.append(avg_train_loss)
+
+            # Validation
+            self.models['slat_flow_model'].eval()
+            total_val_loss = 0.0
+            num_val_batches = 0
+
+            with torch.no_grad():
+                for text, structured_latent in val_loader:
+                    structured_latent = sp.sparse_cat(structured_latent, dim=0).to(self.device)
+                    text_features = self.encode_text(text).to(self.device)
+
+                    with torch.amp.autocast(device_type=self.device.type):
+                        loss_slat = self.compute_loss_slat(structured_latent, text_features)
+
+                    total_val_loss += loss_slat.item()
+                    num_val_batches += 1  
+
+            avg_val_loss = total_val_loss / num_val_batches if num_val_batches > 0 else 0
+            val_loss_values.append(avg_val_loss)
+
+            # Logging
+            epoch_bar.set_postfix({"Train Loss": f"{avg_train_loss:.4f}", "Val Loss": f"{avg_val_loss:.4f}"})
+
+            with open(log_file_path, "a", newline="") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow([epoch+1, f"{avg_train_loss:.4f}", f"{avg_val_loss:.4f}"])
+
+            if (epoch+1) % save_interval == 0 or avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                save_file(self.models['slat_flow_model'].module.state_dict(), slat_model_path)
+
+        if plot_loss:
+            plt.figure(figsize=(10, 5))
+            plt.plot(range(1, num_epochs + 1), train_loss_values, label="Train Loss", color="blue")
+            plt.plot(range(1, num_epochs + 1), val_loss_values, label="Val Loss", color="red")
+            plt.xlabel("Epochs")
+            plt.ylabel("Loss")
+            plt.title("SLat Flow Model - Training & Validation Loss")
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(save_dir, "slat_loss.png"), dpi=300, bbox_inches="tight")

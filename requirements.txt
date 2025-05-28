@@ -1,0 +1,56 @@
+# PyTorch + CUDA 12.6
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# Build tools
+wheel
+setuptools
+ninja
+pydantic==2.10.6
+
+# Image & video processing
+pillow
+imageio
+imageio-ffmpeg
+opencv-python-headless
+
+# Progress bar, configs
+tqdm
+easydict
+
+# Math and SciPy stack
+scipy
+packaging
+
+# 3D processing
+open3d
+trimesh
+xatlas
+pyvista
+pymeshfix
+igraph
+
+# ONNX
+onnxruntime
+
+# Transformers
+transformers
+
+# MongoDB
+pymongo
+six
+python-dotenv
+
+# Utility package from GitHub
+git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8
+
+# Rembg
+rembg
+
+xformers
+spconv-cu124
+
+# Gradio
+gradio
+gradio_litmodel3d==0.0.1
