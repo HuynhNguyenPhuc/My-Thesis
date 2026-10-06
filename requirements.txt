@@ -21,6 +21,7 @@ easydict
 
 # Math and SciPy stack
 scipy
+pandas
 packaging
 
 # 3D processing
@@ -36,6 +37,9 @@ onnxruntime
 
 # Transformers
 transformers
+
+# Captioning (Gemini)
+google-genai
 
 # MongoDB
 pymongo

@@ -263,7 +263,7 @@ if __name__ == '__main__':
             f.write(f'  - Number of assets with sparse structure latents extracted:\n')
             for model in ss_latent_models:
                 f.write(f'    - {model}: {metadata[f"ss_latent_{model}"].sum()}\n')
-        f.write(f'  - Number of assets with captions: {metadata["captions"].count()}\n')
+        f.write(f'  - Number of assets with captions: {metadata["captions"].count() if "captions" in metadata.columns else 0}\n')
         f.write(f'  - Number of assets with image conditions: {metadata["cond_rendered"].sum()}\n')
         
     with open(os.path.join(opt.output_dir, 'statistics.txt'), 'r') as f:

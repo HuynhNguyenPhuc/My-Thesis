@@ -398,22 +398,21 @@ FodyWeavers.xsd
 *.sln.iml
 
 # TRELLIS Project
-assets
-datasets
+/assets
+/datasets
 TRELLIS-image-large
 TRELLIS-text
 TRELLIS-text-inference
 TRELLIS-text-train
-dataset_toolkits/datasets/3D-FUTURE.py
-dataset_toolkits/datasets/ABO.py
-dataset_toolkits/datasets/HSSD.py
-dataset_toolkits/datasets/ObjaverseXL.py
-dataset_toolkits/datasets/Toys4k.py
-GaussianDreamer/collected_gifs
-GaussianDreamer/gifs
-GaussianDreamer/extracted_frames
-GaussianDreamer/outputs
 **/ckpts/
 **/renders/
 **/shapes/
 **/.ipynb_checkpoints
+outputs/
+temp/
+
+# Claude Code
+CLAUDE.md
+
+# Secrets
+.env
